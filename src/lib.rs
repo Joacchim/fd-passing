@@ -10,6 +10,13 @@ use std::os::unix::net::{UnixStream, UnixListener, UnixDatagram};
 use std::os::unix;
 
 use libc::{c_void, c_int};
+#[cfg(target_os = "macos")]
+use libc::c_uint;
+
+#[cfg(not(target_os = "macos"))]
+use libc::__errno_location;
+#[cfg(target_os = "macos")]
+use libc::__error as __errno_location;
 
 pub enum FdImplementor {
     File(File),
@@ -50,21 +57,53 @@ impl FdImplementor {
     }
 }
 
-// XXX TODO FIXME TODO XXXX
-// Create a c binding to retrieve the given value "dynamically" from the C
-// code, as it looked complex to map
-// XXX TODO FIXME TODO XXXX
-const SCM_RIGHTS : c_int = 0x01;
+extern "C" {
+    #[doc(hidden)]
+    fn get_SCM_RIGHTS() -> c_int;
+}
+
+macro_rules! auto_cast {
+    ($right:expr) => {{
+        #[cfg(not(target_os = "macos"))]
+        {
+            $right
+        }
+        #[cfg(target_os = "macos")]
+        {
+            $right as c_uint
+        }
+    }};
+    ($right:expr, $cast:ty) => {{
+        #[cfg(not(target_os = "macos"))]
+        {
+            $right
+        }
+        #[cfg(target_os = "macos")]
+        {
+            $right as $cast
+        }
+    }}
+}
 
 // XXX TODO FIXME TODO XXX
 // Make the three following functions into a static object initialized only
 // once with the required values.
 // XXX TODO FIXME TODO XXX
+#[cfg(not(target_os = "macos"))]
 fn compute_aligned(basesz: usize) -> usize {
     let mod_ = basesz % size_of::<libc::size_t>();
     match mod_ {
         0 => basesz,
         _ => basesz + (size_of::<libc::size_t>() - mod_),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn compute_aligned(basesz: usize) -> usize {
+    let mod_ = basesz % size_of::<u32>();
+    match mod_ {
+        0 => basesz,
+        _ => basesz + (size_of::<u32>() - mod_),
     }
 }
 
@@ -76,7 +115,7 @@ fn compute_msglen(len: usize) -> usize {
     compute_aligned(size_of::<libc::cmsghdr>()) + len
 }
 
-#[cfg(debug)]
+#[cfg(any(debug, test))]
 fn dump_msg(msg: &libc::msghdr) {
     let data = msg as *const libc::msghdr as *const c_void as *const libc::c_char;
     let sz = size_of_val(msg);
@@ -100,18 +139,19 @@ fn dump_msg(msg: &libc::msghdr) {
     unsafe {
         let ctrlp = msg.msg_control as *const libc::cmsghdr;
 
-        println!("msg.control:    {:?}",     ctrlp);
-        println!("msg.controllen: {}",  msg.msg_controllen);
-        println!("msg.iov:        {:?}",         msg.msg_iov as *const c_void);
-        println!("msg.iovlen:     {}",      msg.msg_iovlen);
+        println!("msg.control:    {:?}", ctrlp);
+        println!("msg.controllen: {}",   msg.msg_controllen);
+        println!("msg.iov:        {:?}", msg.msg_iov as *const c_void);
+        println!("msg.iovlen:     {}",   msg.msg_iovlen);
 
         let ctrl = *ctrlp;
-        println!("ctrl.level:     {}",  ctrl.cmsg_level);
-        println!("ctrl.type:      {}",   ctrl.cmsg_type);
-        println!("ctrl.len:       {}",    ctrl.cmsg_len);
+        println!("ctrl.level:     {}", ctrl.cmsg_level);
+        println!("ctrl.type:      {}", ctrl.cmsg_type);
+        println!("ctrl.len:       {}", ctrl.cmsg_len);
     }
 }
 
+// TODO: impl this as a method to FdImplementor or UnixStream.
 pub fn send(channel: &UnixStream, wrapped: FdImplementor) -> Result<(), String> {
     let (rawfd, mut fdtype) = wrapped.to();
 
@@ -121,29 +161,28 @@ pub fn send(channel: &UnixStream, wrapped: FdImplementor) -> Result<(), String> 
 
     iov.iov_base = &mut fdtype as *mut i32 as *mut c_void;
     iov.iov_len = size_of_val(&fdtype);
-    
+
     message.msg_control = controlbuf.as_mut_ptr() as *mut c_void;
-    message.msg_controllen = size_of_val(&controlbuf);
+    message.msg_controllen = auto_cast!(controlbuf.len());
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
 
     unsafe {
         let controlp : *mut libc::cmsghdr = message.msg_control as *mut libc::cmsghdr;
         (*controlp).cmsg_level = libc::SOL_SOCKET;
-        (*controlp).cmsg_type = SCM_RIGHTS;
-        (*controlp).cmsg_len = compute_msglen(size_of::<c_int>());
+        (*controlp).cmsg_type = get_SCM_RIGHTS();
+        (*controlp).cmsg_len = auto_cast!(compute_msglen(size_of::<c_int>()));
 
         let datap : *mut c_int = controlp.offset(1) as *mut c_int; 
         *datap = rawfd;
 
-        #[cfg(debug)]
+        #[cfg(any(debug, test))]
         dump_msg(&message);
 
-        let written = libc::sendmsg(channel.as_raw_fd(), &mut message, 0);
-        match written {
-             x if x == size_of::<c_int>() as isize => Ok(()),
+        match libc::sendmsg(channel.as_raw_fd(), &mut message, 0) {
+            x if x == size_of::<c_int>() as isize => Ok(()),
             -1 => {
-                let s = libc::strerror(*libc::__errno_location());
+                let s = libc::strerror(*__errno_location());
                 let slen = libc::strlen(s);
                 let serr = String::from_raw_parts(s as *mut u8, slen, slen);
                 let rerr = serr.clone();
@@ -155,6 +194,7 @@ pub fn send(channel: &UnixStream, wrapped: FdImplementor) -> Result<(), String> 
     }
 }
 
+// TODO: impl this as a method to FdImplementor or UnixStream.
 pub fn receive(channel: &UnixStream) -> Result<FdImplementor, String> {
     let mut fdtype : c_int = -1;
     let mut controlbuf = vec![0u8; compute_bufspace(size_of::<c_int>())];
@@ -163,18 +203,18 @@ pub fn receive(channel: &UnixStream) -> Result<FdImplementor, String> {
 
     iov.iov_base = &mut fdtype as *mut i32 as *mut c_void;
     iov.iov_len = size_of::<c_int>();
-    
+
     message.msg_control = controlbuf.as_mut_ptr() as *mut c_void;
-    message.msg_controllen = size_of_val(&controlbuf);
+    message.msg_controllen = auto_cast!(size_of_val(&controlbuf));
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
-    
+
     unsafe {
         let read = libc::recvmsg(channel.as_raw_fd(), &mut message, 0);
         match read {
             x if x == size_of::<c_int>() as isize => {
                 let controlp : *mut libc::cmsghdr =
-                    if message.msg_controllen >= size_of::<libc::cmsghdr>() {
+                    if message.msg_controllen >= auto_cast!(size_of::<libc::cmsghdr>()) {
                         message.msg_control as *mut libc::cmsghdr
                     } else {
                         ::std::ptr::null_mut()
@@ -184,20 +224,20 @@ pub fn receive(channel: &UnixStream) -> Result<FdImplementor, String> {
                 // explicitly to ensure consistency with the provided server
                 // API (which only sends one int packed with only one cmsghdr struct).
                 if (*controlp).cmsg_level != libc::SOL_SOCKET
-                   || (*controlp).cmsg_type != SCM_RIGHTS {
+                   || (*controlp).cmsg_type != get_SCM_RIGHTS() {
                     return Err("Message was not the expected command: format mismatch".to_owned());
                 }
-                if message.msg_controllen > compute_bufspace(size_of::<c_int>()) {
+                if message.msg_controllen > auto_cast!(compute_bufspace(size_of::<c_int>())) {
                     return Err("Message read was longer than expected: format mismatch".to_owned());
                 }
-                if message.msg_controllen < compute_bufspace(size_of::<c_int>()) {
+                if message.msg_controllen < auto_cast!(compute_bufspace(size_of::<c_int>())) {
                     return Err("Message read was shorter than expected: format mismatch".to_owned());
                 }
                 let rawfd = *((message.msg_control as *mut libc::cmsghdr).offset(1) as *mut c_int);
                 FdImplementor::from(fdtype, rawfd).ok_or("Unexpected file descriptor type".to_owned())
             },
             -1 => {
-                let s = libc::strerror(*libc::__errno_location());
+                let s = libc::strerror(*__errno_location());
                 let slen = libc::strlen(s);
                 let serr = String::from_raw_parts(s as *mut u8, slen, slen);
                 let rerr = serr.clone();
@@ -211,9 +251,11 @@ pub fn receive(channel: &UnixStream) -> Result<FdImplementor, String> {
 
 #[cfg(test)]
 mod tests {
-    use ::*;
     use std::io::{Write, Read};
-
+    use std::os::unix::net::{UnixStream, UnixListener};
+    use std::fs::{self, remove_file};
+    use std::{thread, time};
+    use ::{FdImplementor, receive, send};
 
     #[test]
     fn run() {
@@ -231,13 +273,17 @@ mod tests {
                 -1 => assert!(false, ""),
                 0 => {
                     let res = run_fd_receiver(sockpath, &linetwo);
-                    assert!(res.is_ok());
+                    if !res.is_ok() {
+                        panic!(res.err().unwrap());
+                    }
                 },
                 _ => {
-                    std::thread::sleep(std::time::Duration::new(1, 0));
+                    thread::sleep(time::Duration::new(1, 0));
                     let res = run_fd_sender(sockpath, fpath, &lineone);
-                    assert!(res.is_ok());
-                    std::thread::sleep(std::time::Duration::new(1, 0));
+                    if !res.is_ok() {
+                        panic!(res.err().unwrap());
+                    }
+                    thread::sleep(time::Duration::new(1, 0));
                     let mut f = fs::File::open(fpath).unwrap();
                     let mut readstr = String::new();
                     let bytes = f.read_to_string(&mut readstr).unwrap();
@@ -250,9 +296,9 @@ mod tests {
 
     #[allow(unused_must_use)]
     fn cleanup(sockpath: &str, fpath: &str) {
-        std::fs::remove_file(sockpath);
-        std::fs::remove_file(fpath);
-        std::fs::remove_file("/tmp/rust-fd-passing-child-log.txt");
+        remove_file(sockpath);
+        remove_file(fpath);
+        remove_file("/tmp/rust-fd-passing-child-log.txt");
     }
 
     fn printfile(text: &str) {
