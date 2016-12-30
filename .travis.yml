@@ -95,3 +95,5 @@ script:
   - rustc --version
   - RUST_BACKTRACE=1 cargo build
   - RUST_BACKTRACE=1 cargo test
+  - cd examples
+  - echo test | RUST_BACKTRACE=1 cargo run
