@@ -5,6 +5,7 @@ authors = ["David Pineau <dav.pineau@gmail.com>", "Guillaume Gomez <guillaume1.g
 
 description = "A crate to pass file descriptors between processes."
 repository = "https://github.com/Joacchim/fd-passing"
+documentation = "https://docs.rs/fd-passing/"
 readme = "README.md"
 keywords = ["fd", "passing", "file", "descriptor", "process"]
 license = "MIT"
