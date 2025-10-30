@@ -97,7 +97,7 @@ pub fn receive(channel: &UnixStream) -> Result<FdImplementor, String> {
     iov.iov_len = size_of::<c_int>();
 
     message.msg_control = controlbuf.as_mut_ptr() as *mut c_void;
-    message.msg_controllen = auto_cast!(size_of_val(&controlbuf));
+    message.msg_controllen = auto_cast!(controlbuf.len());
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
 
